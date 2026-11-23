@@ -1,1 +1,471 @@
 
+# Chỉ cần MỘT file này trong repo GitHub (đường dẫn: .github/workflows/build.yml)
+# Nó tự tạo toàn bộ mã nguồn, build ra RtpGate.jar rồi đưa lên mục Releases.
+name: Build RtpGate
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tạo mã nguồn
+        run: |
+          mkdir -p src/main/java/vn/rtpgate src/main/resources
+          cat > pom.xml <<'POM_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+
+            <groupId>vn.rtpgate</groupId>
+            <artifactId>RtpGate</artifactId>
+            <version>1.0.0</version>
+            <packaging>jar</packaging>
+
+            <properties>
+              <maven.compiler.release>21</maven.compiler.release>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+
+            <repositories>
+              <repository>
+                <id>papermc</id>
+                <url>https://repo.papermc.io/repository/maven-public/</url>
+              </repository>
+            </repositories>
+
+            <dependencies>
+              <dependency>
+                <groupId>io.papermc.paper</groupId>
+                <artifactId>paper-api</artifactId>
+                <!-- Đổi số này nếu server của bạn dùng phiên bản khác -->
+                <version>1.21.4-R0.1-SNAPSHOT</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+
+            <build>
+              <finalName>RtpGate</finalName>
+              <plugins>
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-compiler-plugin</artifactId>
+                  <version>3.13.0</version>
+                </plugin>
+              </plugins>
+            </build>
+          </project>
+          POM_EOF
+          cat > src/main/resources/plugin.yml <<'PLUGIN_EOF'
+          name: RtpGate
+          version: 1.0.0
+          main: vn.rtpgate.RtpGate
+          api-version: "1.21"
+          description: Cổng bước vào là tự RTP sau vài giây
+          commands:
+            rtpgate:
+              description: Quản lý cổng RTP
+              usage: /rtpgate <pos1|pos2|create|sethub|delhub|test|reload>
+              permission: rtpgate.admin
+          permissions:
+            rtpgate.admin:
+              default: op
+            rtpgate.use:
+              default: true
+          PLUGIN_EOF
+          cat > src/main/resources/config.yml <<'CONFIG_EOF'
+          # Vùng cổng: đừng sửa tay, dùng /rtpgate pos1, /rtpgate pos2, /rtpgate create
+          gate:
+            configured: false
+            world: world
+            min: {x: 0, y: 0, z: 0}
+            max: {x: 0, y: 0, z: 0}
+
+          # World sẽ RTP tới (chỉ dùng cho world thường / Overworld)
+          target-world: world
+
+          # Số giây chờ sau khi bước vào cổng rồi mới RTP
+          delay-seconds: 2
+
+          # Điểm trung gian (tuỳ chọn): bước vào cổng -> tới đây trước -> chờ delay -> RTP
+          # Đặt bằng /rtpgate sethub, tắt bằng /rtpgate delhub
+          hub:
+            enabled: false
+            world: world
+            x: 0.5
+            y: 100.0
+            z: 0.5
+            yaw: 0.0
+            pitch: 0.0
+
+          # Khu vực random: tâm + khoảng cách tối thiểu/tối đa (số block)
+          random:
+            center-x: 0
+            center-z: 0
+            min-radius: 500
+            max-radius: 5000
+            max-attempts: 30
+
+          # Chống kích hoạt liên tục
+          cooldown-seconds: 5
+
+          messages:
+            title: "&aĐang đưa bạn đi..."
+            subtitle: "&7Tìm vị trí ngẫu nhiên"
+            done: "&aĐã dịch chuyển ngẫu nhiên!"
+            fail: "&cKhông tìm được vị trí an toàn, hãy thử lại."
+            no-world: "&cKhông tìm thấy world đích, báo admin."
+          CONFIG_EOF
+          cat > src/main/java/vn/rtpgate/RtpGate.java <<'JAVA_EOF'
+          package vn.rtpgate;
+
+          import org.bukkit.Bukkit;
+          import org.bukkit.ChatColor;
+          import org.bukkit.HeightMap;
+          import org.bukkit.Location;
+          import org.bukkit.Material;
+          import org.bukkit.World;
+          import org.bukkit.block.Block;
+          import org.bukkit.command.Command;
+          import org.bukkit.command.CommandSender;
+          import org.bukkit.command.PluginCommand;
+          import org.bukkit.command.TabExecutor;
+          import org.bukkit.configuration.file.FileConfiguration;
+          import org.bukkit.entity.Player;
+          import org.bukkit.event.EventHandler;
+          import org.bukkit.event.Listener;
+          import org.bukkit.event.player.PlayerMoveEvent;
+          import org.bukkit.event.player.PlayerQuitEvent;
+          import org.bukkit.plugin.java.JavaPlugin;
+
+          import java.util.ArrayList;
+          import java.util.EnumSet;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
+          import java.util.concurrent.ThreadLocalRandom;
+
+          public class RtpGate extends JavaPlugin implements Listener, TabExecutor {
+
+              private static final Set<Material> UNSAFE = EnumSet.of(
+                      Material.WATER, Material.LAVA, Material.MAGMA_BLOCK, Material.CACTUS,
+                      Material.FIRE, Material.SOUL_FIRE, Material.CAMPFIRE, Material.SOUL_CAMPFIRE,
+                      Material.SWEET_BERRY_BUSH, Material.POWDER_SNOW, Material.POINTED_DRIPSTONE,
+                      Material.COBWEB);
+
+              private final Map<UUID, Location> firstPos = new HashMap<>();
+              private final Map<UUID, Location> secondPos = new HashMap<>();
+              private final Set<UUID> busy = new HashSet<>();
+              private final Map<UUID, Long> lastUse = new HashMap<>();
+
+              private boolean gateOn;
+              private String gateWorld = "world";
+              private int minX, minY, minZ, maxX, maxY, maxZ;
+
+              @Override
+              public void onEnable() {
+                  saveDefaultConfig();
+                  loadRegion();
+                  getServer().getPluginManager().registerEvents(this, this);
+                  PluginCommand cmd = getCommand("rtpgate");
+                  if (cmd != null) {
+                      cmd.setExecutor(this);
+                      cmd.setTabCompleter(this);
+                  }
+              }
+
+              private void loadRegion() {
+                  FileConfiguration c = getConfig();
+                  gateOn = c.getBoolean("gate.configured", false);
+                  gateWorld = c.getString("gate.world", "world");
+                  minX = c.getInt("gate.min.x");
+                  minY = c.getInt("gate.min.y");
+                  minZ = c.getInt("gate.min.z");
+                  maxX = c.getInt("gate.max.x");
+                  maxY = c.getInt("gate.max.y");
+                  maxZ = c.getInt("gate.max.z");
+              }
+
+              private boolean inGate(Location l) {
+                  if (l.getWorld() == null || !l.getWorld().getName().equals(gateWorld)) return false;
+                  int x = l.getBlockX();
+                  int y = l.getBlockY();
+                  int z = l.getBlockZ();
+                  return x >= minX && x <= maxX && y >= minY && y <= maxY && z >= minZ && z <= maxZ;
+              }
+
+              private String color(String s) {
+                  return ChatColor.translateAlternateColorCodes('&', s);
+              }
+
+              private String m(String key) {
+                  return color(getConfig().getString("messages." + key, key));
+              }
+
+              // ---------- Sự kiện ----------
+
+              @EventHandler(ignoreCancelled = true)
+              public void onMove(PlayerMoveEvent e) {
+                  if (!gateOn) return;
+                  Location from = e.getFrom();
+                  Location to = e.getTo();
+                  if (to == null) return;
+                  if (from.getBlockX() == to.getBlockX()
+                          && from.getBlockY() == to.getBlockY()
+                          && from.getBlockZ() == to.getBlockZ()) return;
+                  if (!inGate(to)) return;
+
+                  Player p = e.getPlayer();
+                  if (!p.hasPermission("rtpgate.use")) return;
+                  UUID id = p.getUniqueId();
+                  if (busy.contains(id)) return;
+
+                  long cd = getConfig().getLong("cooldown-seconds", 5) * 1000L;
+                  Long last = lastUse.get(id);
+                  if (last != null && System.currentTimeMillis() - last < cd) return;
+
+                  startRtp(p);
+              }
+
+              @EventHandler
+              public void onQuit(PlayerQuitEvent e) {
+                  UUID id = e.getPlayer().getUniqueId();
+                  busy.remove(id);
+                  firstPos.remove(id);
+                  secondPos.remove(id);
+                  lastUse.remove(id);
+              }
+
+              // ---------- RTP ----------
+
+              private void startRtp(Player p) {
+                  UUID id = p.getUniqueId();
+                  busy.add(id);
+                  lastUse.put(id, System.currentTimeMillis());
+                  FileConfiguration c = getConfig();
+
+                  if (c.getBoolean("hub.enabled", false)) {
+                      World hw = Bukkit.getWorld(c.getString("hub.world", "world"));
+                      if (hw != null) {
+                          Location hub = new Location(hw,
+                                  c.getDouble("hub.x"), c.getDouble("hub.y"), c.getDouble("hub.z"),
+                                  (float) c.getDouble("hub.yaw"), (float) c.getDouble("hub.pitch"));
+                          p.teleportAsync(hub);
+                      }
+                  }
+
+                  p.sendTitle(m("title"), m("subtitle"), 5, 40, 10);
+
+                  long ticks = Math.max(0L, c.getLong("delay-seconds", 2)) * 20L;
+                  Bukkit.getScheduler().runTaskLater(this, () -> randomTeleport(p), ticks);
+              }
+
+              private void randomTeleport(Player p) {
+                  UUID id = p.getUniqueId();
+                  if (!p.isOnline()) {
+                      busy.remove(id);
+                      return;
+                  }
+                  World w = Bukkit.getWorld(getConfig().getString("target-world", "world"));
+                  if (w == null) {
+                      p.sendMessage(m("no-world"));
+                      busy.remove(id);
+                      return;
+                  }
+                  findSpot(p, w, getConfig().getInt("random.max-attempts", 30));
+              }
+
+              private void findSpot(Player p, World w, int attemptsLeft) {
+                  UUID id = p.getUniqueId();
+                  if (!p.isOnline()) {
+                      busy.remove(id);
+                      return;
+                  }
+                  if (attemptsLeft <= 0) {
+                      p.sendMessage(m("fail"));
+                      busy.remove(id);
+                      return;
+                  }
+
+                  FileConfiguration c = getConfig();
+                  int cx = c.getInt("random.center-x");
+                  int cz = c.getInt("random.center-z");
+                  int min = Math.max(0, c.getInt("random.min-radius", 500));
+                  int max = Math.max(min + 1, c.getInt("random.max-radius", 5000));
+
+                  ThreadLocalRandom r = ThreadLocalRandom.current();
+                  double angle = r.nextDouble(0, Math.PI * 2);
+                  double dist = r.nextDouble(min, max);
+                  int x = cx + (int) Math.round(Math.cos(angle) * dist);
+                  int z = cz + (int) Math.round(Math.sin(angle) * dist);
+
+                  w.getChunkAtAsync(x >> 4, z >> 4).thenAccept(chunk ->
+                          Bukkit.getScheduler().runTask(this, () -> {
+                              if (!p.isOnline()) {
+                                  busy.remove(id);
+                                  return;
+                              }
+                              Location loc = safeSpot(w, x, z);
+                              if (loc == null) {
+                                  findSpot(p, w, attemptsLeft - 1);
+                                  return;
+                              }
+                              loc.setYaw(p.getLocation().getYaw());
+                              loc.setPitch(p.getLocation().getPitch());
+                              p.teleportAsync(loc).thenAccept(ok ->
+                                      Bukkit.getScheduler().runTask(this, () -> {
+                                          busy.remove(id);
+                                          lastUse.put(id, System.currentTimeMillis());
+                                          if (ok) p.sendMessage(m("done"));
+                                      }));
+                          }));
+              }
+
+              private Location safeSpot(World w, int x, int z) {
+                  int y = w.getHighestBlockYAt(x, z, HeightMap.MOTION_BLOCKING_NO_LEAVES);
+                  if (y <= w.getMinHeight() || y + 2 >= w.getMaxHeight()) return null;
+
+                  Material ground = w.getBlockAt(x, y, z).getType();
+                  if (!ground.isSolid() || UNSAFE.contains(ground)) return null;
+
+                  Block feet = w.getBlockAt(x, y + 1, z);
+                  Block head = w.getBlockAt(x, y + 2, z);
+                  if (!feet.isPassable() || !head.isPassable()) return null;
+                  if (feet.isLiquid() || head.isLiquid()) return null;
+                  if (UNSAFE.contains(feet.getType()) || UNSAFE.contains(head.getType())) return null;
+
+                  Location loc = new Location(w, x + 0.5, y + 1, z + 0.5);
+                  if (!w.getWorldBorder().isInside(loc)) return null;
+                  return loc;
+              }
+
+              // ---------- Lệnh ----------
+
+              @Override
+              public boolean onCommand(CommandSender s, Command cmd, String label, String[] a) {
+                  if (!s.hasPermission("rtpgate.admin")) {
+                      s.sendMessage(color("&cBạn không có quyền dùng lệnh này."));
+                      return true;
+                  }
+                  String sub = a.length == 0 ? "help" : a[0].toLowerCase();
+
+                  if (sub.equals("reload")) {
+                      reloadConfig();
+                      loadRegion();
+                      s.sendMessage(color("&aĐã tải lại config."));
+                      return true;
+                  }
+                  if (!(s instanceof Player p)) {
+                      s.sendMessage("Chỉ dùng lệnh này trong game.");
+                      return true;
+                  }
+                  UUID id = p.getUniqueId();
+
+                  switch (sub) {
+                      case "pos1" -> {
+                          firstPos.put(id, p.getLocation().getBlock().getLocation());
+                          p.sendMessage(color("&aĐã đặt góc 1."));
+                      }
+                      case "pos2" -> {
+                          secondPos.put(id, p.getLocation().getBlock().getLocation());
+                          p.sendMessage(color("&aĐã đặt góc 2."));
+                      }
+                      case "create" -> {
+                          Location l1 = firstPos.get(id);
+                          Location l2 = secondPos.get(id);
+                          if (l1 == null || l2 == null) {
+                              p.sendMessage(color("&cHãy đặt /rtpgate pos1 và /rtpgate pos2 trước."));
+                              return true;
+                          }
+                          if (l1.getWorld() == null || !l1.getWorld().equals(l2.getWorld())) {
+                              p.sendMessage(color("&cHai góc phải ở cùng một world."));
+                              return true;
+                          }
+                          FileConfiguration c = getConfig();
+                          c.set("gate.world", l1.getWorld().getName());
+                          c.set("gate.min.x", Math.min(l1.getBlockX(), l2.getBlockX()));
+                          c.set("gate.min.y", Math.min(l1.getBlockY(), l2.getBlockY()));
+                          c.set("gate.min.z", Math.min(l1.getBlockZ(), l2.getBlockZ()));
+                          c.set("gate.max.x", Math.max(l1.getBlockX(), l2.getBlockX()));
+                          c.set("gate.max.y", Math.max(l1.getBlockY(), l2.getBlockY()));
+                          c.set("gate.max.z", Math.max(l1.getBlockZ(), l2.getBlockZ()));
+                          c.set("gate.configured", true);
+                          saveConfig();
+                          loadRegion();
+                          p.sendMessage(color("&aĐã tạo cổng RTP. Bước vào vùng đó để thử."));
+                      }
+                      case "sethub" -> {
+                          Location l = p.getLocation();
+                          FileConfiguration c = getConfig();
+                          c.set("hub.enabled", true);
+                          c.set("hub.world", l.getWorld().getName());
+                          c.set("hub.x", l.getX());
+                          c.set("hub.y", l.getY());
+                          c.set("hub.z", l.getZ());
+                          c.set("hub.yaw", (double) l.getYaw());
+                          c.set("hub.pitch", (double) l.getPitch());
+                          saveConfig();
+                          p.sendMessage(color("&aĐã đặt điểm trung gian tại vị trí của bạn."));
+                      }
+                      case "delhub" -> {
+                          getConfig().set("hub.enabled", false);
+                          saveConfig();
+                          p.sendMessage(color("&aĐã tắt điểm trung gian."));
+                      }
+                      case "test" -> {
+                          if (busy.contains(id)) {
+                              p.sendMessage(color("&cĐang RTP rồi."));
+                          } else {
+                              startRtp(p);
+                          }
+                      }
+                      default -> p.sendMessage(color("&e/rtpgate <pos1|pos2|create|sethub|delhub|test|reload>"));
+                  }
+                  return true;
+              }
+
+              @Override
+              public List<String> onTabComplete(CommandSender s, Command cmd, String alias, String[] a) {
+                  List<String> out = new ArrayList<>();
+                  if (a.length == 1) {
+                      for (String x : List.of("pos1", "pos2", "create", "sethub", "delhub", "test", "reload")) {
+                          if (x.startsWith(a[0].toLowerCase())) out.add(x);
+                      }
+                  }
+                  return out;
+              }
+          }
+          JAVA_EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Build jar
+        run: mvn -B package
+
+      - name: Đăng jar lên Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v1.0.${{ github.run_number }}" target/RtpGate.jar \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "RtpGate build ${{ github.run_number }}" \
+            --notes "Build tự động từ GitHub Actions"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RtpGate
+          path: target/RtpGate.jar
