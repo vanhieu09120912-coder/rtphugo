@@ -1,4 +1,3 @@
-
 # Chỉ cần MỘT file này trong repo GitHub (đường dẫn: .github/workflows/build.yml)
 # Nó tự tạo toàn bộ mã nguồn, build ra RtpGate.jar rồi đưa lên mục Releases.
 name: Build RtpGate
@@ -72,7 +71,7 @@ jobs:
           commands:
             rtpgate:
               description: Quản lý cổng RTP
-              usage: /rtpgate <pos1|pos2|create|sethub|delhub|test|reload>
+              usage: /rtpgate <pos1|pos2|create [biome]|remove|sethub|delhub|test|reload>
               permission: rtpgate.admin
           permissions:
             rtpgate.admin:
@@ -87,6 +86,11 @@ jobs:
             world: world
             min: {x: 0, y: 0, z: 0}
             max: {x: 0, y: 0, z: 0}
+
+          # Biome thật của vùng cổng, được đổi khi gõ /rtpgate create (để trống hoặc none = không đổi)
+          # Ví dụ: swamp, badlands, cherry_grove, desert, mushroom_fields
+          # Cũng có thể gõ thẳng: /rtpgate create desert. Muốn trả biome cũ: /rtpgate remove
+          gate-biome: swamp
 
           # World sẽ RTP tới (chỉ dùng cho world thường / Overworld)
           target-world: world
@@ -131,13 +135,17 @@ jobs:
           import org.bukkit.HeightMap;
           import org.bukkit.Location;
           import org.bukkit.Material;
+          import org.bukkit.NamespacedKey;
+          import org.bukkit.Registry;
           import org.bukkit.World;
+          import org.bukkit.block.Biome;
           import org.bukkit.block.Block;
           import org.bukkit.command.Command;
           import org.bukkit.command.CommandSender;
           import org.bukkit.command.PluginCommand;
           import org.bukkit.command.TabExecutor;
           import org.bukkit.configuration.file.FileConfiguration;
+          import org.bukkit.configuration.file.YamlConfiguration;
           import org.bukkit.entity.Player;
           import org.bukkit.event.EventHandler;
           import org.bukkit.event.Listener;
@@ -145,6 +153,8 @@ jobs:
           import org.bukkit.event.player.PlayerQuitEvent;
           import org.bukkit.plugin.java.JavaPlugin;
 
+          import java.io.File;
+          import java.io.IOException;
           import java.util.ArrayList;
           import java.util.EnumSet;
           import java.util.HashMap;
@@ -349,6 +359,112 @@ jobs:
                   return loc;
               }
 
+              // ---------- Biome của vùng cổng ----------
+
+              private File backupFile() {
+                  return new File(getDataFolder(), "biome-backup.yml");
+              }
+
+              private void refreshChunks(World w, int fromCx, int toCx, int fromCz, int toCz) {
+                  for (int cx = fromCx; cx <= toCx; cx++) {
+                      for (int cz = fromCz; cz <= toCz; cz++) {
+                          try {
+                              w.getClass().getMethod("refreshChunk", int.class, int.class).invoke(w, cx, cz);
+                          } catch (Exception ignored) {
+                              // bản server không có hàm này thì bỏ qua
+                          }
+                      }
+                  }
+              }
+
+              private void paintGate(CommandSender s, World w, String name) {
+                  restoreBiome(); // trả biome cũ của cổng trước đó (nếu có)
+                  if (name == null || name.isBlank()
+                          || name.equalsIgnoreCase("none") || name.equalsIgnoreCase("off")) return;
+
+                  String low = name.toLowerCase();
+                  NamespacedKey key = NamespacedKey.fromString(low.contains(":") ? low : "minecraft:" + low);
+                  Biome biome = key == null ? null : Registry.BIOME.get(key);
+                  if (biome == null) {
+                      s.sendMessage(color("&cKhông có biome \"" + name + "\". Ví dụ: swamp, badlands, cherry_grove, desert."));
+                      return;
+                  }
+
+                  int y0 = Math.max(minY, w.getMinHeight());
+                  int y1 = Math.min(maxY, w.getMaxHeight() - 1);
+                  long total = (long) ((maxX >> 2) - (minX >> 2) + 1)
+                          * ((y1 >> 2) - (y0 >> 2) + 1)
+                          * ((maxZ >> 2) - (minZ >> 2) + 1);
+                  if (total > 50000) {
+                      s.sendMessage(color("&cVùng cổng quá lớn để đổi biome, hãy chọn vùng nhỏ hơn."));
+                      return;
+                  }
+
+                  // Biome lưu theo ô 4x4x4 block nên vùng đổi có thể rộng hơn cổng tối đa 3 block mỗi phía
+                  List<String> backup = new ArrayList<>();
+                  for (int cx = minX >> 2; cx <= maxX >> 2; cx++) {
+                      for (int cy = y0 >> 2; cy <= y1 >> 2; cy++) {
+                          for (int cz = minZ >> 2; cz <= maxZ >> 2; cz++) {
+                              int x = cx << 2;
+                              int y = cy << 2;
+                              int z = cz << 2;
+                              backup.add(x + "," + y + "," + z + "," + w.getBiome(x, y, z).getKey());
+                              w.setBiome(x, y, z, biome);
+                          }
+                      }
+                  }
+
+                  YamlConfiguration yml = new YamlConfiguration();
+                  yml.set("world", w.getName());
+                  yml.set("cells", backup);
+                  try {
+                      getDataFolder().mkdirs();
+                      yml.save(backupFile());
+                  } catch (IOException ex) {
+                      getLogger().warning("Không lưu được biome-backup.yml: " + ex.getMessage());
+                  }
+
+                  refreshChunks(w, minX >> 4, maxX >> 4, minZ >> 4, maxZ >> 4);
+                  s.sendMessage(color("&aĐã đổi biome vùng cổng thành &e" + name + "&a (" + backup.size()
+                          + " ô). Nếu chưa thấy đổi, hãy thoát ra rồi vào lại."));
+              }
+
+              private int restoreBiome() {
+                  File f = backupFile();
+                  if (!f.exists()) return 0;
+                  YamlConfiguration yml = YamlConfiguration.loadConfiguration(f);
+                  World w = Bukkit.getWorld(yml.getString("world", ""));
+                  if (w == null) return 0;
+
+                  int count = 0;
+                  int minCx = Integer.MAX_VALUE;
+                  int maxCx = Integer.MIN_VALUE;
+                  int minCz = Integer.MAX_VALUE;
+                  int maxCz = Integer.MIN_VALUE;
+                  for (String line : yml.getStringList("cells")) {
+                      try {
+                          String[] part = line.split(",", 4);
+                          int x = Integer.parseInt(part[0]);
+                          int y = Integer.parseInt(part[1]);
+                          int z = Integer.parseInt(part[2]);
+                          NamespacedKey key = NamespacedKey.fromString(part[3]);
+                          Biome b = key == null ? null : Registry.BIOME.get(key);
+                          if (b == null) continue;
+                          w.setBiome(x, y, z, b);
+                          count++;
+                          minCx = Math.min(minCx, x >> 4);
+                          maxCx = Math.max(maxCx, x >> 4);
+                          minCz = Math.min(minCz, z >> 4);
+                          maxCz = Math.max(maxCz, z >> 4);
+                      } catch (RuntimeException ex) {
+                          // dòng hỏng thì bỏ qua
+                      }
+                  }
+                  if (count > 0) refreshChunks(w, minCx, maxCx, minCz, maxCz);
+                  f.delete();
+                  return count;
+              }
+
               // ---------- Lệnh ----------
 
               @Override
@@ -403,6 +519,16 @@ jobs:
                           saveConfig();
                           loadRegion();
                           p.sendMessage(color("&aĐã tạo cổng RTP. Bước vào vùng đó để thử."));
+                          paintGate(p, l1.getWorld(),
+                                  a.length >= 2 ? a[1] : getConfig().getString("gate-biome", "swamp"));
+                      }
+                      case "remove" -> {
+                          getConfig().set("gate.configured", false);
+                          saveConfig();
+                          loadRegion();
+                          int restored = restoreBiome();
+                          p.sendMessage(color("&aĐã xoá cổng RTP."
+                                  + (restored > 0 ? " Đã trả biome cũ (" + restored + " ô)." : "")));
                       }
                       case "sethub" -> {
                           Location l = p.getLocation();
@@ -429,7 +555,7 @@ jobs:
                               startRtp(p);
                           }
                       }
-                      default -> p.sendMessage(color("&e/rtpgate <pos1|pos2|create|sethub|delhub|test|reload>"));
+                      default -> p.sendMessage(color("&e/rtpgate <pos1|pos2|create [biome]|remove|sethub|delhub|test|reload>"));
                   }
                   return true;
               }
@@ -438,8 +564,15 @@ jobs:
               public List<String> onTabComplete(CommandSender s, Command cmd, String alias, String[] a) {
                   List<String> out = new ArrayList<>();
                   if (a.length == 1) {
-                      for (String x : List.of("pos1", "pos2", "create", "sethub", "delhub", "test", "reload")) {
+                      for (String x : List.of("pos1", "pos2", "create", "remove", "sethub", "delhub", "test", "reload")) {
                           if (x.startsWith(a[0].toLowerCase())) out.add(x);
+                      }
+                  } else if (a.length == 2 && a[0].equalsIgnoreCase("create")) {
+                      String pre = a[1].toLowerCase();
+                      if ("none".startsWith(pre)) out.add("none");
+                      for (Biome b : Registry.BIOME) {
+                          String k = b.getKey().getKey();
+                          if (k.startsWith(pre)) out.add(k);
                       }
                   }
                   return out;
