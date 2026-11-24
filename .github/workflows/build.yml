@@ -579,7 +579,103 @@ jobs:
               }
           }
           JAVA_EOF
+      - name: Thêm hiệu ứng cổng
+        run: |
+          cat > src/main/java/vn/rtpgate/GateFx.java <<'FX_EOF'
+          package vn.rtpgate;
 
+          import org.bukkit.Bukkit;
+          import org.bukkit.Location;
+          import org.bukkit.Particle;
+          import org.bukkit.World;
+          import org.bukkit.configuration.file.FileConfiguration;
+          import org.bukkit.entity.Player;
+          import org.bukkit.plugin.java.JavaPlugin;
+
+          import java.util.concurrent.ThreadLocalRandom;
+
+          /** Vẽ khung sáng và hạt portal quanh vùng cổng để nhìn thấy được trên mọi địa hình. */
+          public class GateFx {
+
+              private final JavaPlugin plugin;
+              private int ticks = 0;
+
+              public GateFx(JavaPlugin plugin) {
+                  this.plugin = plugin;
+              }
+
+              public void start() {
+                  Bukkit.getScheduler().runTaskTimer(plugin, this::tick, 40L, 5L);
+              }
+
+              private void tick() {
+                  ticks++;
+                  FileConfiguration c = plugin.getConfig();
+                  if (!c.getBoolean("gate.configured", false)) return;
+                  if (!c.getBoolean("effect.enabled", true)) return;
+                  World w = Bukkit.getWorld(c.getString("gate.world", "world"));
+                  if (w == null) return;
+
+                  double x1 = c.getInt("gate.min.x");
+                  double y1 = c.getInt("gate.min.y");
+                  double z1 = c.getInt("gate.min.z");
+                  double x2 = c.getInt("gate.max.x") + 1;
+                  double y2 = c.getInt("gate.max.y") + 1;
+                  double z2 = c.getInt("gate.max.z") + 1;
+                  if (x2 <= x1 || y2 <= y1 || z2 <= z1) return;
+
+                  // Chỉ vẽ khi có người chơi ở gần
+                  Location centre = new Location(w, (x1 + x2) / 2, (y1 + y2) / 2, (z1 + z2) / 2);
+                  double reach = 40 + Math.max(x2 - x1, Math.max(y2 - y1, z2 - z1));
+                  boolean near = false;
+                  for (Player p : w.getPlayers()) {
+                      if (p.getLocation().distanceSquared(centre) <= reach * reach) {
+                          near = true;
+                          break;
+                      }
+                  }
+                  if (!near) return;
+
+                  // Hạt portal màu tím bên trong vùng cổng (mỗi 5 tick)
+                  ThreadLocalRandom r = ThreadLocalRandom.current();
+                  double volume = (x2 - x1) * (y2 - y1) * (z2 - z1);
+                  int count = (int) Math.max(8, Math.min(60, volume / 2));
+                  for (int i = 0; i < count; i++) {
+                      w.spawnParticle(Particle.PORTAL,
+                              r.nextDouble(x1, x2), r.nextDouble(y1, y2), r.nextDouble(z1, z2),
+                              1, 0.0, 0.0, 0.0, 0.0);
+                  }
+
+                  // Khung sáng viền quanh vùng (mỗi 20 tick)
+                  if (ticks % 4 == 0) {
+                      for (double x : new double[]{x1, x2}) {
+                          for (double z : new double[]{z1, z2}) {
+                              edge(w, x, y1, z, x, y2, z);
+                          }
+                      }
+                      for (double y : new double[]{y1, y2}) {
+                          edge(w, x1, y, z1, x2, y, z1);
+                          edge(w, x1, y, z2, x2, y, z2);
+                          edge(w, x1, y, z1, x1, y, z2);
+                          edge(w, x2, y, z1, x2, y, z2);
+                      }
+                  }
+              }
+
+              private void edge(World w, double ax, double ay, double az, double bx, double by, double bz) {
+                  double len = Math.sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay) + (bz - az) * (bz - az));
+                  int steps = (int) Math.min(40, Math.max(1, Math.ceil(len)));
+                  for (int i = 0; i <= steps; i++) {
+                      double t = (double) i / steps;
+                      w.spawnParticle(Particle.END_ROD,
+                              ax + (bx - ax) * t, ay + (by - ay) * t, az + (bz - az) * t,
+                              1, 0.0, 0.0, 0.0, 0.0);
+                  }
+              }
+          }
+          FX_EOF
+          sed -i 's/^\( *\)saveDefaultConfig();/&\n\1new GateFx(this).start();/' src/main/java/vn/rtpgate/RtpGate.java
+          grep -q 'new GateFx(this).start();' src/main/java/vn/rtpgate/RtpGate.java || { echo "Không gắn được hiệu ứng vào RtpGate.java"; exit 1; }
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
